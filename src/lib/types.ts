@@ -29,4 +29,5 @@ export interface PriceRecord {
   max_price: number | null;
   listings_count: number | null;
   source: 'kolesa' | 'mycar' | 'combined';
+  created_at?: string;
 }

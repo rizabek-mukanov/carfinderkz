@@ -43,11 +43,12 @@ export default function Dashboard() {
         const pricesData = await pricesRes.json();
         setPriceHistory(pricesData);
         if (pricesData.length > 0) {
-          const latestDate = pricesData.reduce(
-            (max: string, r: PriceRecord) => (r.date > max ? r.date : max),
-            pricesData[0].date
-          );
-          setLastUpdated(latestDate);
+          const latestRecord = pricesData.reduce((latest: PriceRecord, current: PriceRecord) => {
+            const latestTime = latest.created_at ? new Date(latest.created_at).getTime() : new Date(latest.date).getTime();
+            const currentTime = current.created_at ? new Date(current.created_at).getTime() : new Date(current.date).getTime();
+            return currentTime > latestTime ? current : latest;
+          }, pricesData[0]);
+          setLastUpdated(latestRecord.created_at || latestRecord.date);
         }
       }
     } catch (error) {
