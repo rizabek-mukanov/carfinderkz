@@ -1,7 +1,15 @@
 import { NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
 
+export async function GET() {
+  return handleScrape();
+}
+
 export async function POST() {
+  return handleScrape();
+}
+
+async function handleScrape() {
   const today = new Date().toISOString().split('T')[0];
 
   const cars = [
