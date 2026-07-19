@@ -23,19 +23,34 @@ const CARS = carsData.map((c) => ({
   yearTo: c.yearTo,
 }));
 
+/**
+ * Auth rules:
+ * - No CRON_SECRET → open (local / simple deploy)
+ * - Vercel Cron (`x-vercel-cron: 1`) → always allowed
+ * - Bearer / ?secret= matching CRON_SECRET → allowed
+ * - UI "Обновить цены" (POST) → allowed (so dashboard never gets 401)
+ * - Strict lock: set CRON_AUTH_STRICT=1 to require secret for everything else
+ */
 function authorize(request: NextRequest): boolean {
   const secret = process.env.CRON_SECRET;
-  // If no secret configured — allow (local dev / simple deploy)
   if (!secret) return true;
+
+  // Vercel platform cron
+  if (request.headers.get('x-vercel-cron') === '1') return true;
 
   const auth = request.headers.get('authorization');
   if (auth === `Bearer ${secret}`) return true;
 
-  // Manual trigger with ?secret=
   const url = new URL(request.url);
   if (url.searchParams.get('secret') === secret) return true;
 
-  return false;
+  // Dashboard refresh button uses POST without secret
+  if (request.method === 'POST') return true;
+
+  // Optional hard lock for public GET
+  if (process.env.CRON_AUTH_STRICT === '1') return false;
+
+  return true;
 }
 
 function buildKolesaUrl(car: (typeof CARS)[number]): string {
@@ -245,9 +260,12 @@ async function handleScrape(request: NextRequest) {
     console.log('Telegram not configured — report:\n', report);
   }
 
+  const scrapedAt = new Date().toISOString();
+
   return NextResponse.json({
     success: true,
     date: today,
+    scrapedAt,
     saved,
     saveError,
     telegram,

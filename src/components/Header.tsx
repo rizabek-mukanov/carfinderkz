@@ -6,9 +6,43 @@ interface HeaderProps {
   lastUpdated: string | null;
   onRefresh: () => Promise<void>;
   dataSource?: 'mock' | 'supabase';
+  refreshError?: string | null;
 }
 
-export default function Header({ lastUpdated, onRefresh, dataSource = 'mock' }: HeaderProps) {
+const ALMATY_TZ = 'Asia/Almaty';
+
+/** Format timestamps for KZ users (UTC+5). Date-only strings show no fake clock time. */
+export function formatUpdatedAt(value: string): string {
+  // YYYY-MM-DD from price_history.date — no reliable time
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const d = new Date(`${value}T12:00:00+05:00`);
+    return d.toLocaleDateString('ru-RU', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+      timeZone: ALMATY_TZ,
+    });
+  }
+
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+
+  return d.toLocaleString('ru-RU', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: ALMATY_TZ,
+  });
+}
+
+export default function Header({
+  lastUpdated,
+  onRefresh,
+  dataSource = 'mock',
+  refreshError = null,
+}: HeaderProps) {
   const [loading, setLoading] = useState(false);
 
   const handleRefresh = async () => {
@@ -50,13 +84,12 @@ export default function Header({ lastUpdated, onRefresh, dataSource = 'mock' }: 
         <div className="header-right">
           {lastUpdated && (
             <span className="last-updated">
-              Обновлено: {new Date(lastUpdated).toLocaleDateString('ru-RU', {
-                day: 'numeric',
-                month: 'short',
-                year: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-              })}
+              Обновлено: {formatUpdatedAt(lastUpdated)}
+            </span>
+          )}
+          {refreshError && (
+            <span className="last-updated" style={{ color: '#f87171' }}>
+              {refreshError}
             </span>
           )}
           <button

@@ -15,12 +15,41 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [dataSource, setDataSource] = useState<'mock' | 'supabase'>('mock');
+  const [refreshError, setRefreshError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchData();
   }, []);
 
-  const fetchData = async () => {
+  /** Prefer newest calendar date; created_at is unreliable after upsert same day. */
+  const resolveLastUpdated = (pricesData: PriceRecord[]): string | null => {
+    if (pricesData.length === 0) return null;
+
+    const maxDate = pricesData.reduce(
+      (max, r) => (r.date > max ? r.date : max),
+      pricesData[0].date
+    );
+
+    // Among records for the latest day, pick newest created_at if present
+    const sameDay = pricesData.filter((r) => r.date === maxDate);
+    let newestCreated: string | null = null;
+    for (const r of sameDay) {
+      if (!r.created_at) continue;
+      if (!newestCreated || r.created_at > newestCreated) {
+        newestCreated = r.created_at;
+      }
+    }
+
+    // If created_at is from an older day than maxDate, ignore it (stale upsert)
+    if (newestCreated) {
+      const createdDay = newestCreated.slice(0, 10);
+      if (createdDay === maxDate) return newestCreated;
+    }
+
+    return maxDate;
+  };
+
+  const fetchData = async (opts?: { keepLastUpdated?: string }) => {
     setLoading(true);
     try {
       const [carsRes, pricesRes] = await Promise.all([
@@ -42,13 +71,12 @@ export default function Dashboard() {
         }
         const pricesData = await pricesRes.json();
         setPriceHistory(pricesData);
-        if (pricesData.length > 0) {
-          const latestRecord = pricesData.reduce((latest: PriceRecord, current: PriceRecord) => {
-            const latestTime = latest.created_at ? new Date(latest.created_at).getTime() : new Date(latest.date).getTime();
-            const currentTime = current.created_at ? new Date(current.created_at).getTime() : new Date(current.date).getTime();
-            return currentTime > latestTime ? current : latest;
-          }, pricesData[0]);
-          setLastUpdated(latestRecord.created_at || latestRecord.date);
+
+        // After a successful scrape, keep the exact scrape timestamp from the API
+        if (opts?.keepLastUpdated) {
+          setLastUpdated(opts.keepLastUpdated);
+        } else {
+          setLastUpdated(resolveLastUpdated(pricesData));
         }
       }
     } catch (error) {
@@ -59,13 +87,27 @@ export default function Dashboard() {
   };
 
   const handleRefresh = async () => {
+    setRefreshError(null);
     try {
       const res = await fetch('/api/prices/scrape', { method: 'POST' });
-      if (res.ok) {
-        await fetchData();
+      const body = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        setRefreshError(
+          res.status === 401
+            ? 'Ошибка 401: нет доступа к scrape'
+            : `Ошибка обновления (${res.status})`
+        );
+        console.error('Scrape failed:', res.status, body);
+        return;
       }
+
+      const scrapedAt =
+        typeof body.scrapedAt === 'string' ? body.scrapedAt : new Date().toISOString();
+      await fetchData({ keepLastUpdated: scrapedAt });
     } catch (error) {
       console.error('Error refreshing prices:', error);
+      setRefreshError('Не удалось обновить цены');
     }
   };
 
@@ -96,7 +138,12 @@ export default function Dashboard() {
 
   return (
     <>
-      <Header lastUpdated={lastUpdated} onRefresh={handleRefresh} dataSource={dataSource} />
+      <Header
+        lastUpdated={lastUpdated}
+        onRefresh={handleRefresh}
+        dataSource={dataSource}
+        refreshError={refreshError}
+      />
 
       <main className="main-container">
         {/* Cars Grid */}
