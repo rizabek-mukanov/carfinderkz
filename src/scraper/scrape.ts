@@ -1,15 +1,19 @@
 /**
  * Daily Price Scraper for kolesa.kz and mycar.kz
- * 
+ *
  * Запуск: npx tsx src/scraper/scrape.ts
- * 
- * Этот скрипт собирает средние цены на 10 моделей авто
- * с kolesa.kz и mycar.kz и сохраняет результаты в Supabase.
- * 
- * Если Supabase не настроен — выводит результаты в консоль.
+ *
+ * Собирает средние цены, сохраняет в Supabase и (если настроен)
+ * шлёт отчёт об изменениях в Telegram.
  */
 
 import { createClient } from '@supabase/supabase-js';
+import {
+  buildTelegramPriceReport,
+  computePriceChanges,
+  type PriceSnapshot,
+} from '../lib/price-report';
+import { isTelegramConfigured, sendTelegramMessage } from '../lib/telegram';
 
 interface CarConfig {
   id: string;
@@ -106,40 +110,79 @@ function generateFallbackPrice(car: CarConfig): { avg: number; min: number; max:
   };
 }
 
+function loadEnvLocal(): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('fs') as typeof import('fs');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require('path') as typeof import('path');
+    const envPath = path.resolve(process.cwd(), '.env.local');
+    if (!fs.existsSync(envPath)) return;
+
+    const envContent = fs.readFileSync(envPath, 'utf-8');
+    for (const line of envContent.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq < 1) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let val = trimmed.slice(eq + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      if (!process.env[key]) {
+        process.env[key] = val;
+      }
+    }
+  } catch (e) {
+    console.log('  ⚠️ Error loading .env.local:', e);
+  }
+}
+
+async function getPreviousPrices(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client: any,
+  carIds: string[],
+  beforeDate: string
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  if (!client) return map;
+
+  const { data, error } = await client
+    .from('price_history')
+    .select('car_id, avg_price, date')
+    .in('car_id', carIds)
+    .lt('date', beforeDate)
+    .order('date', { ascending: false });
+
+  if (error || !data) return map;
+
+  for (const row of data as Array<{ car_id: string; avg_price: number | null }>) {
+    if (map.has(row.car_id)) continue;
+    if (row.avg_price != null) map.set(row.car_id, Number(row.avg_price));
+  }
+  return map;
+}
+
 async function main() {
   console.log('🚗 Car Finder — Daily Price Scraper');
   console.log(`📅 Date: ${new Date().toISOString()}`);
   console.log('---');
 
-  // Setup Supabase env loading fallback for local runs
-  let envUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-  let envKey = process.env.SUPABASE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
-  
-  if (!envUrl || !envKey) {
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const envPath = path.resolve(process.cwd(), '.env.local');
-      if (fs.existsSync(envPath)) {
-        const envContent = fs.readFileSync(envPath, 'utf-8');
-        envContent.split('\n').forEach((line: string) => {
-          const parts = line.split('=');
-          if (parts.length >= 2) {
-            const key = parts[0].trim();
-            const val = parts.slice(1).join('=').trim();
-            if (key === 'NEXT_PUBLIC_SUPABASE_URL') envUrl = val;
-            if (key === 'NEXT_PUBLIC_SUPABASE_ANON_KEY') envKey = val;
-          }
-        });
-      }
-    } catch (e) {
-      console.log('  ⚠️ Error loading env.local manually:', e);
-    }
-  }
+  loadEnvLocal();
+
+  const envUrl =
+    process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+  const envKey =
+    process.env.SUPABASE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
   const supabaseUrl = envUrl.replace(/\/rest\/v1\/?$/, '');
   const supabaseKey = envKey;
-  const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
+  const supabase =
+    supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
   if (supabase) {
     console.log('✅ Supabase connected');
@@ -147,53 +190,84 @@ async function main() {
     console.log('⚠️ Supabase not configured — results will be printed only');
   }
 
+  if (isTelegramConfigured()) {
+    console.log('✅ Telegram configured');
+  } else {
+    console.log('⚠️ Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)');
+  }
+
   const today = new Date().toISOString().split('T')[0];
-  const results = [];
+  const previousByCarId = await getPreviousPrices(
+    supabase,
+    CARS.map((c) => c.id),
+    today
+  );
+
+  const results: Array<{
+    car_id: string;
+    date: string;
+    avg_price: number;
+    min_price: number;
+    max_price: number;
+    listings_count: number;
+    source: 'kolesa' | 'combined';
+  }> = [];
+  const snapshots: PriceSnapshot[] = [];
 
   for (const car of CARS) {
     console.log(`\n🔍 Scraping: ${car.brand} ${car.model}...`);
 
-    // Try to scrape real data
     const prices = await scrapeKolesa(car);
 
-    let record;
+    let avg: number;
+    let min: number;
+    let max: number;
+    let count: number;
+    let source: 'kolesa' | 'combined';
+
     if (prices.length >= 3) {
-      // Use real data
-      const avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
-      const min = Math.min(...prices);
-      const max = Math.max(...prices);
-      record = {
-        car_id: car.id,
-        date: today,
-        avg_price: avg,
-        min_price: min,
-        max_price: max,
-        listings_count: prices.length,
-        source: 'kolesa' as const,
-      };
-      console.log(`  📊 Real data: avg=${avg.toLocaleString('ru-RU')} ₸ (${prices.length} listings)`);
+      avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
+      min = Math.min(...prices);
+      max = Math.max(...prices);
+      count = prices.length;
+      source = 'kolesa';
+      console.log(
+        `  📊 Real data: avg=${avg.toLocaleString('ru-RU')} ₸ (${prices.length} listings)`
+      );
     } else {
-      // Fallback to generated data
       const fallback = generateFallbackPrice(car);
-      record = {
-        car_id: car.id,
-        date: today,
-        avg_price: fallback.avg,
-        min_price: fallback.min,
-        max_price: fallback.max,
-        listings_count: fallback.count,
-        source: 'combined' as const,
-      };
+      avg = fallback.avg;
+      min = fallback.min;
+      max = fallback.max;
+      count = fallback.count;
+      source = 'combined';
       console.log(`  📊 Fallback data: avg=${fallback.avg.toLocaleString('ru-RU')} ₸`);
     }
 
-    results.push(record);
+    results.push({
+      car_id: car.id,
+      date: today,
+      avg_price: avg,
+      min_price: min,
+      max_price: max,
+      listings_count: count,
+      source,
+    });
 
-    // Rate limiting — 2 second delay between requests
+    snapshots.push({
+      car_id: car.id,
+      brand: car.brand,
+      model: car.model,
+      avg_price: avg,
+      min_price: min,
+      max_price: max,
+      listings_count: count,
+      source,
+    });
+
     await new Promise((resolve) => setTimeout(resolve, 2000));
   }
 
-  // Save to Supabase
   if (supabase) {
     console.log('\n💾 Saving to Supabase...');
     const { error } = await supabase
@@ -207,16 +281,34 @@ async function main() {
     }
   }
 
-  // Print summary
+  const changes = computePriceChanges(snapshots, previousByCarId);
+  const report = buildTelegramPriceReport(changes, today);
+
   console.log('\n📋 Summary:');
   console.log('─'.repeat(60));
-  for (const r of results) {
-    const car = CARS.find((c) => c.id === r.car_id)!;
+  for (const c of changes) {
+    const deltaStr =
+      c.delta == null
+        ? 'new'
+        : c.delta === 0
+          ? '0'
+          : `${c.delta > 0 ? '+' : ''}${c.delta.toLocaleString('ru-RU')}`;
     console.log(
-      `  ${car.brand} ${car.model}: ${r.avg_price?.toLocaleString('ru-RU')} ₸ (${r.listings_count} listings) [${r.source}]`
+      `  ${c.brand} ${c.model}: ${c.avg_price.toLocaleString('ru-RU')} ₸ (${deltaStr})`
     );
   }
   console.log('─'.repeat(60));
+
+  if (isTelegramConfigured()) {
+    console.log('\n📨 Sending Telegram report...');
+    const tg = await sendTelegramMessage(report);
+    if (tg.ok) {
+      console.log('✅ Telegram message sent');
+    } else {
+      console.error('❌ Telegram error:', tg.error);
+    }
+  }
+
   console.log('✅ Done!');
 }
 

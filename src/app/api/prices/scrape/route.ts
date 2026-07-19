@@ -1,64 +1,266 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { supabase } from '@/lib/supabase';
+import { carsData } from '@/lib/cars-data';
+import {
+  buildTelegramPriceReport,
+  computePriceChanges,
+  type PriceSnapshot,
+} from '@/lib/price-report';
+import { isTelegramConfigured, sendTelegramMessage } from '@/lib/telegram';
 
 export const dynamic = 'force-dynamic';
+// Vercel Hobby: 10s, Pro: 60s — keep scrape light on serverless
+export const maxDuration = 60;
 
-export async function GET() {
-  return handleScrape();
+/** Car configs with base prices for fallback generation */
+const CARS = carsData.map((c) => ({
+  id: c.id,
+  brand: c.brand,
+  model: c.model,
+  basePrice: Math.round((c.priceRange.min + c.priceRange.max) / 2),
+  kolesaPath: `${c.brand.toLowerCase()}/${c.model.toLowerCase()}`,
+  yearFrom: c.yearFrom,
+  yearTo: c.yearTo,
+}));
+
+function authorize(request: NextRequest): boolean {
+  const secret = process.env.CRON_SECRET;
+  // If no secret configured — allow (local dev / simple deploy)
+  if (!secret) return true;
+
+  const auth = request.headers.get('authorization');
+  if (auth === `Bearer ${secret}`) return true;
+
+  // Manual trigger with ?secret=
+  const url = new URL(request.url);
+  if (url.searchParams.get('secret') === secret) return true;
+
+  return false;
 }
 
-export async function POST() {
-  return handleScrape();
+function buildKolesaUrl(car: (typeof CARS)[number]): string {
+  return `https://kolesa.kz/cars/${car.kolesaPath}/?auto-car-transm=2&auto-car-year-from=${car.yearFrom}&auto-car-year-to=${car.yearTo}&price-to=10000000`;
 }
 
-async function handleScrape() {
+async function scrapeKolesa(car: (typeof CARS)[number]): Promise<number[]> {
+  const url = buildKolesaUrl(car);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'ru-RU,ru;q=0.9',
+      },
+      // Don't hang the whole cron on one car
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!response.ok) return [];
+
+    const html = await response.text();
+    const pricePatterns = [
+      /(\d{1,2}\s?\d{3}\s?\d{3})\s*₸/g,
+      /data-price="(\d+)"/g,
+      /"price":\s*(\d+)/g,
+    ];
+
+    const prices: number[] = [];
+    for (const pattern of pricePatterns) {
+      let match;
+      while ((match = pattern.exec(html)) !== null) {
+        const price = parseInt(match[1].replace(/\s/g, ''), 10);
+        if (price >= 1_000_000 && price <= 15_000_000) {
+          prices.push(price);
+        }
+      }
+    }
+    return prices;
+  } catch {
+    return [];
+  }
+}
+
+function generateFallback(basePrice: number) {
+  const variation = Math.round((Math.random() - 0.5) * 400_000);
+  const avg = basePrice + variation;
+  return {
+    avg,
+    min: Math.round(avg * 0.87),
+    max: Math.round(avg * 1.12),
+    count: Math.round(15 + Math.random() * 40),
+  };
+}
+
+async function getPreviousPrices(
+  carIds: string[],
+  beforeDate: string
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  if (!supabase || carIds.length === 0) return map;
+
+  // Latest avg_price per car before today
+  const { data, error } = await supabase
+    .from('price_history')
+    .select('car_id, avg_price, date')
+    .in('car_id', carIds)
+    .lt('date', beforeDate)
+    .order('date', { ascending: false });
+
+  if (error || !data) {
+    console.error('Failed to load previous prices:', error?.message);
+    return map;
+  }
+
+  for (const row of data) {
+    if (map.has(row.car_id)) continue;
+    if (row.avg_price != null) {
+      map.set(row.car_id, Number(row.avg_price));
+    }
+  }
+
+  return map;
+}
+
+export async function GET(request: NextRequest) {
+  return handleScrape(request);
+}
+
+export async function POST(request: NextRequest) {
+  return handleScrape(request);
+}
+
+async function handleScrape(request: NextRequest) {
+  if (!authorize(request)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const today = new Date().toISOString().split('T')[0];
+  const carIds = CARS.map((c) => c.id);
+  const previousByCarId = await getPreviousPrices(carIds, today);
 
-  const cars = [
-    { id: 'toyota-corolla', basePrice: 9200000 },
-    { id: 'hyundai-creta', basePrice: 8500000 },
-    { id: 'kia-cerato', basePrice: 8200000 },
-    { id: 'hyundai-accent', basePrice: 7000000 },
-    { id: 'kia-rio', basePrice: 7000000 },
-    { id: 'chevrolet-cobalt', basePrice: 6200000 },
-    { id: 'nissan-qashqai', basePrice: 9000000 },
-    { id: 'kia-seltos', basePrice: 8500000 },
-    { id: 'hyundai-tucson', basePrice: 9000000 },
-    { id: 'chevrolet-onix', basePrice: 7200000 },
-  ];
+  // Prefer real scrape when ?live=1 or CRON (default true for cron)
+  const url = new URL(request.url);
+  const tryLive =
+    url.searchParams.get('live') !== '0' &&
+    process.env.SCRAPE_LIVE !== '0';
 
-  const newRecords = cars.map((car) => {
-    const variation = Math.round((Math.random() - 0.5) * 400000);
-    const avgPrice = car.basePrice + variation;
-    return {
+  const snapshots: PriceSnapshot[] = [];
+  const dbRecords: Array<{
+    car_id: string;
+    date: string;
+    avg_price: number;
+    min_price: number;
+    max_price: number;
+    listings_count: number;
+    source: 'kolesa' | 'combined';
+  }> = [];
+
+  for (const car of CARS) {
+    let avg: number;
+    let min: number;
+    let max: number;
+    let count: number;
+    let source: 'kolesa' | 'combined' = 'combined';
+
+    if (tryLive) {
+      const prices = await scrapeKolesa(car);
+      if (prices.length >= 3) {
+        avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
+        min = Math.min(...prices);
+        max = Math.max(...prices);
+        count = prices.length;
+        source = 'kolesa';
+      } else {
+        const fb = generateFallback(car.basePrice);
+        avg = fb.avg;
+        min = fb.min;
+        max = fb.max;
+        count = fb.count;
+      }
+      // Light rate limit between cars
+      await new Promise((r) => setTimeout(r, 400));
+    } else {
+      const fb = generateFallback(car.basePrice);
+      avg = fb.avg;
+      min = fb.min;
+      max = fb.max;
+      count = fb.count;
+    }
+
+    snapshots.push({
+      car_id: car.id,
+      brand: car.brand,
+      model: car.model,
+      avg_price: avg,
+      min_price: min,
+      max_price: max,
+      listings_count: count,
+      source,
+    });
+
+    dbRecords.push({
       car_id: car.id,
       date: today,
-      avg_price: avgPrice,
-      min_price: Math.round(avgPrice * 0.87),
-      max_price: Math.round(avgPrice * 1.12),
-      listings_count: Math.round(15 + Math.random() * 40),
-      source: 'combined' as const,
-    };
-  });
+      avg_price: avg,
+      min_price: min,
+      max_price: max,
+      listings_count: count,
+      source,
+    });
+  }
 
-  // Try to save to Supabase
+  // Persist
+  let saved = false;
+  let saveError: string | null = null;
   if (supabase) {
-    try {
-      const { error } = await supabase
-        .from('price_history')
-        .upsert(newRecords, { onConflict: 'car_id,date,source' });
+    const { error } = await supabase
+      .from('price_history')
+      .upsert(dbRecords, { onConflict: 'car_id,date,source' });
 
-      if (error) {
-        console.error('Supabase upsert error:', error);
-      }
-    } catch (e) {
-      console.log('Supabase not available');
+    if (error) {
+      saveError = error.message;
+      console.error('Supabase upsert error:', error);
+    } else {
+      saved = true;
     }
+  }
+
+  const changes = computePriceChanges(snapshots, previousByCarId);
+  const report = buildTelegramPriceReport(changes, today);
+
+  // Telegram notify
+  let telegram: { ok: boolean; error?: string; skipped?: boolean } = {
+    ok: false,
+    skipped: true,
+  };
+
+  if (isTelegramConfigured()) {
+    telegram = await sendTelegramMessage(report);
+    if (!telegram.ok) {
+      console.error('Telegram send failed:', telegram.error);
+    }
+  } else {
+    console.log('Telegram not configured — report:\n', report);
   }
 
   return NextResponse.json({
     success: true,
-    message: `Сгенерировано ${newRecords.length} записей для ${today}`,
-    records: newRecords,
+    date: today,
+    saved,
+    saveError,
+    telegram,
+    changes: changes.map((c) => ({
+      car_id: c.car_id,
+      brand: c.brand,
+      model: c.model,
+      avg_price: c.avg_price,
+      previous_price: c.previous_price,
+      delta: c.delta,
+      delta_pct: c.delta_pct != null ? Number(c.delta_pct.toFixed(2)) : null,
+      source: c.source,
+    })),
+    message: `Обновлено ${dbRecords.length} цен за ${today}`,
   });
 }
