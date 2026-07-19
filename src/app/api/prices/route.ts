@@ -63,6 +63,8 @@ function generateMockPriceHistory(): PriceRecord[] {
   return records;
 }
 
+export const dynamic = 'force-dynamic';
+
 export async function GET() {
   // Try Supabase first
   if (supabase) {
@@ -72,15 +74,38 @@ export async function GET() {
         .select('*')
         .order('date', { ascending: true });
 
-      if (!error && data && data.length > 0) {
-        return NextResponse.json(data);
+      if (!error && data) {
+        // If database is empty or has very little data, seed it with 30-day history so the chart looks nice
+        if (data.length < 50) {
+          console.log('Supabase table has few records, seeding 30-day history...');
+          const seedData = generateMockPriceHistory();
+          
+          // Insert the seed data
+          const { error: insertError } = await supabase
+            .from('price_history')
+            .upsert(seedData, { onConflict: 'car_id,date,source' });
+
+          if (!insertError) {
+            return NextResponse.json(seedData, {
+              headers: { 'x-data-source': 'supabase' }
+            });
+          } else {
+            console.error('Error seeding data:', insertError);
+          }
+        } else {
+          return NextResponse.json(data, {
+            headers: { 'x-data-source': 'supabase' }
+          });
+        }
       }
     } catch (e) {
-      console.log('Supabase not available, using mock data');
+      console.log('Supabase error or not available, using mock data:', e);
     }
   }
 
   // Fallback to mock data
   const mockData = generateMockPriceHistory();
-  return NextResponse.json(mockData);
+  return NextResponse.json(mockData, {
+    headers: { 'x-data-source': 'mock' }
+  });
 }

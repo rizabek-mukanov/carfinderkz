@@ -111,9 +111,34 @@ async function main() {
   console.log(`📅 Date: ${new Date().toISOString()}`);
   console.log('---');
 
-  // Setup Supabase
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-  const supabaseKey = process.env.SUPABASE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+  // Setup Supabase env loading fallback for local runs
+  let envUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+  let envKey = process.env.SUPABASE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+  
+  if (!envUrl || !envKey) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const envPath = path.resolve(process.cwd(), '.env.local');
+      if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf-8');
+        envContent.split('\n').forEach((line: string) => {
+          const parts = line.split('=');
+          if (parts.length >= 2) {
+            const key = parts[0].trim();
+            const val = parts.slice(1).join('=').trim();
+            if (key === 'NEXT_PUBLIC_SUPABASE_URL') envUrl = val;
+            if (key === 'NEXT_PUBLIC_SUPABASE_ANON_KEY') envKey = val;
+          }
+        });
+      }
+    } catch (e) {
+      console.log('  ⚠️ Error loading env.local manually:', e);
+    }
+  }
+
+  const supabaseUrl = envUrl.replace(/\/rest\/v1\/?$/, '');
+  const supabaseKey = envKey;
   const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
   if (supabase) {

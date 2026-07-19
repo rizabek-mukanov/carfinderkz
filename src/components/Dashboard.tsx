@@ -14,6 +14,7 @@ export default function Dashboard() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const [dataSource, setDataSource] = useState<'mock' | 'supabase'>('mock');
 
   useEffect(() => {
     fetchData();
@@ -33,6 +34,12 @@ export default function Dashboard() {
       }
 
       if (pricesRes.ok) {
+        const sourceHeader = pricesRes.headers.get('x-data-source');
+        if (sourceHeader === 'supabase') {
+          setDataSource('supabase');
+        } else {
+          setDataSource('mock');
+        }
         const pricesData = await pricesRes.json();
         setPriceHistory(pricesData);
         if (pricesData.length > 0) {
@@ -88,7 +95,7 @@ export default function Dashboard() {
 
   return (
     <>
-      <Header lastUpdated={lastUpdated} onRefresh={handleRefresh} />
+      <Header lastUpdated={lastUpdated} onRefresh={handleRefresh} dataSource={dataSource} />
 
       <main className="main-container">
         {/* Cars Grid */}
