@@ -6,7 +6,12 @@ import {
   computePriceChanges,
   type PriceSnapshot,
 } from '@/lib/price-report';
-import { isTelegramConfigured, sendTelegramMessage } from '@/lib/telegram';
+import { renderPriceInfographic } from '@/lib/price-infographic';
+import {
+  isTelegramConfigured,
+  sendTelegramMessage,
+  sendTelegramPhoto,
+} from '@/lib/telegram';
 
 export const dynamic = 'force-dynamic';
 // Vercel Hobby: 10s, Pro: 60s — keep scrape light on serverless
@@ -245,17 +250,53 @@ async function handleScrape(request: NextRequest) {
   const changes = computePriceChanges(snapshots, previousByCarId);
   const report = buildTelegramPriceReport(changes, today);
 
-  // Telegram notify
-  let telegram: { ok: boolean; error?: string; skipped?: boolean } = {
+  // Telegram notify: PNG infographic + full text report
+  let telegram: {
+    ok: boolean;
+    error?: string;
+    skipped?: boolean;
+    photo?: boolean;
+    text?: boolean;
+  } = {
     ok: false,
     skipped: true,
   };
 
   if (isTelegramConfigured()) {
-    telegram = await sendTelegramMessage(report);
-    if (!telegram.ok) {
-      console.error('Telegram send failed:', telegram.error);
+    let photoOk = false;
+    let textOk = false;
+    const errors: string[] = [];
+
+    try {
+      const { png, caption } = await renderPriceInfographic(changes, today);
+      const photoRes = await sendTelegramPhoto(png, {
+        caption,
+        parseMode: 'HTML',
+        filename: `prices-${today}.png`,
+      });
+      photoOk = photoRes.ok;
+      if (!photoRes.ok) {
+        errors.push(`photo: ${photoRes.error}`);
+        console.error('Telegram photo failed:', photoRes.error);
+      }
+    } catch (e) {
+      errors.push(`infographic: ${(e as Error).message}`);
+      console.error('Infographic render failed:', e);
     }
+
+    const textRes = await sendTelegramMessage(report);
+    textOk = textRes.ok;
+    if (!textRes.ok) {
+      errors.push(`text: ${textRes.error}`);
+      console.error('Telegram text failed:', textRes.error);
+    }
+
+    telegram = {
+      ok: photoOk || textOk,
+      photo: photoOk,
+      text: textOk,
+      error: errors.length ? errors.join('; ') : undefined,
+    };
   } else {
     console.log('Telegram not configured — report:\n', report);
   }
